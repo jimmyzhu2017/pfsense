@@ -234,69 +234,71 @@ function filter_configure() {
 }
 
 function filter_delete_states_for_down_gateways() {
-	global $GatewaysList;
-
 	$any_gateway_down = false;
 	$a_gateways = return_gateways_status();
 	$gateway = "";
-	if (is_array($GatewaysList)) {
-		foreach ($GatewaysList as $gateway) {
-			/* Skip irrelevant or invalid gateway entries */
-			$last_gw = '';
-			if (empty($gateway['monitor']) ||
-			    !is_ipaddr($gateway['monitor']) ||
-			    strstr($gateway['monitor'], "127.0.0.") ||
-			    empty($a_gateways[$gateway['monitor']])) {
-				$last_gw = get_interface_gateway_last($gateway['interface'], $gateway['ipprotocol']);
-				if (!is_ipaddr($last_gw)) {
-					continue;
-				}
+	foreach (get_gateways() as $gateway) {
+		/* Skip irrelevant or invalid gateway entries */
+		$last_gw = '';
+		if (empty($gateway['monitor']) ||
+		    !is_ipaddr($gateway['monitor']) ||
+		    strstr($gateway['monitor'], "127.0.0.")) {
+			// invalid monitor IP address
+			$last_gw = get_interface_gateway_last($gateway['interface'], $gateway['ipprotocol']);
+			if (!is_ipaddr($last_gw)) {
+				continue;
 			}
-			/* Do not trigger these actions if:
-			 * The gateway is configured to not kill states when down
-			 * Gateway monitoring is disabled
-			 * Gateway monitoring action is disabled
-			 * The gateway is forced down. */
-			if (($gateway['gw_down_kill_states'] == 'none') ||
-			    (isset($gateway['monitor_disable'])) ||
-			    (isset($gateway['action_disable'])) ||
-			    (isset($gateway['force_down']))) {
+		} elseif (empty($a_gateways[$gateway['monitor']])) {
+			// no gateway status, check for static configuration
+			$last_gw = $gateway['gateway'];
+			if (!is_ipaddr($last_gw)) {
+				continue;
+			}
+		}
+		/* Do not trigger these actions if:
+		 * The gateway is configured to not kill states when down
+		 * Gateway monitoring is disabled
+		 * Gateway monitoring action is disabled
+		 * The gateway is forced down. */
+		if (($gateway['gw_down_kill_states'] == 'none') ||
+		    (isset($gateway['monitor_disable'])) ||
+		    (isset($gateway['action_disable'])) ||
+		    (isset($gateway['force_down']))) {
+			continue;
+		}
+
+		$gwstatus = &$a_gateways[$gateway['monitor']];
+		$gw_down_kill_states = config_get_path('system/gw_down_kill_states');
+		if (strstr($gwstatus['status'], "down") || is_ipaddr($last_gw)) {
+			$any_gateway_down = $gateway['name'];
+			if ($gw_down_kill_states == 'all') {
+				/* All states will be killed, no need to continue searching. */
+				break;
+			}
+
+			$what_to_kill = gettext("down gateway");
+			$gwip = lookup_gateway_ip_by_name($gateway['name']);
+			if (!is_ipaddr($gwip) && is_ipaddr($last_gw)) {
+				$gwip = $last_gw;
+				$what_to_kill = gettext("dynamic down gateway");
+			}
+			/* Cannot locate the gateway IP address, so we
+			 * cannot proceed. */
+			if (!is_ipaddr($gwip)) {
+				$message = gettext("GW States: Gateway is down but its IP address cannot be located. Skipping state kill.") . ": {$gateway['name']}";
+				update_filter_reload_status($message);
+				log_error($message);
 				continue;
 			}
 
-			$gwstatus = &$a_gateways[$gateway['monitor']];
-			$gw_down_kill_states = config_get_path('system/gw_down_kill_states');
-			if (strstr($gwstatus['status'], "down") || is_ipaddr($last_gw)) {
-				$any_gateway_down = $gateway['name'];
-				if ($gw_down_kill_states == 'all') {
-					/* All states will be killed, no need to continue searching. */
-					break;
-				}
-
-				$what_to_kill = gettext("down gateway");
-				$gwip = lookup_gateway_ip_by_name($gateway['name']);
-				if (!is_ipaddr($gwip) && is_ipaddr($last_gw)) {
-					$gwip = $last_gw;
-					$what_to_kill = gettext("dynamic down gateway");
-				}
-				/* Cannot locate the gateway IP address, so we
-				 * cannot proceed. */
-				if (!is_ipaddr($gwip)) {
-					$message = gettext("GW States: Gateway is down but its IP address cannot be located. Skipping state kill.") . ": {$gateway['name']}";
-					update_filter_reload_status($message);
-					log_error($message);
-					continue;
-				}
-
-				/* Kill states for the down gateway if the flag is on globally
-				 * or configured to do so on a specific gateway. */
-				if (($gw_down_kill_states == 'down') ||
-				    ($gateway['gw_down_kill_states'] == 'down')) {
-					$message = gettext("GW States: Killing states for") . " {$what_to_kill}: {$gateway['name']}, {$gwip}";
-					update_filter_reload_status($message);
-					log_error($message);
-					mwexec("/sbin/pfctl -k gateway -k " . escapeshellarg($gwip));
-				}
+			/* Kill states for the down gateway if the flag is on globally
+			 * or configured to do so on a specific gateway. */
+			if (($gw_down_kill_states == 'down') ||
+			    ($gateway['gw_down_kill_states'] == 'down')) {
+				$message = gettext("GW States: Killing states for") . " {$what_to_kill}: {$gateway['name']}, {$gwip}";
+				update_filter_reload_status($message);
+				log_error($message);
+				mwexec("/sbin/pfctl -k gateway -k " . escapeshellarg($gwip));
 			}
 		}
 	}
@@ -566,7 +568,6 @@ function filter_configure_sync($delete_states_if_needed = true) {
 				return;
 			}
 		}
-		unset($rules_loading, $rules_error);
 	} else {
 		/* Save the last version that works */
 		@copy("{$g['tmp_path']}/rules.debug",
@@ -676,6 +677,10 @@ function filter_configure_sync($delete_states_if_needed = true) {
 	update_filter_reload_status(gettext("Done"));
 	if (platform_booting() == true) {
 		echo gettext("done.") . "\n";
+	}
+	
+	if (!platform_booting() && !$rules_loading) {
+		remove_failover_states();
 	}
 
 	clear_filter_subsystems_dirty();
@@ -1034,7 +1039,7 @@ function filter_generate_gateways() {
 	update_filter_reload_status(gettext("Creating gateway group item..."));
 
 	/* Lookup Gateways to be used in filter rules once */
-	refresh_gateways_cache(); // make sure rules are generated from a current gateway list
+	refresh_gateways(); // make sure rules are generated from a current gateway list
 	$GatewaysList = get_gateways();
 	$GatewayGroupsList = return_gateway_groups_array(true);
 	$GatewaysStatus = return_gateways_status(true);
@@ -2041,13 +2046,21 @@ function filter_nat_rules_outbound_automatic($src) {
 function filter_nat_rules_generate_if ($if, $descr = "", $ipprotocol = "", $src = "any", $srcport = "", $dst = "any", $dstport = "", $natip = "", $natport = "", $nonat = false, $staticnatport = false, $proto = "", $poolopts = "") {
 	global $FilterIflist;
 
+	if (!empty($descr)) {
+		$descr = " # {$descr}";
+	}
+	$src = trim($src); $dst = trim($dst);
+	if (empty($src) || empty($dst)) {
+		return "# source or destination is invalid or doesn't match IP family in nat rule{$descr}\n";
+	}
+
 	/* XXX: billm - any idea if this code is needed? */
 	if ($src == "/32" || $src == "/128" || $src[0] == "/") {
 		return "# src incorrectly specified\n";
 	}
 	$if_friendly = $FilterIflist[$if]['descr'];
 	if (!$if_friendly) {
-		return "# Could not convert {$if} to friendly name(alias) {$descr}\n";
+		return "# Could not convert {$if} to friendly name(alias) in nat rule{$descr}\n";
 	}
 
 	$inet = "";
@@ -2056,13 +2069,13 @@ function filter_nat_rules_generate_if ($if, $descr = "", $ipprotocol = "", $src 
 	}
 	if (is_v6($src) || is_v6($dst) || is_v6($natip)) {
 		if ($inet == "inet") {
-			return "# conflicting ipv4/ipv6 settings in nat rule: " . $descr;
+			return "# conflicting ipv4/ipv6 settings in nat rule{$descr}\n";
 		}
 		$inet = "inet6";
 	}
 	if (($ipprotocol == 'inet' && $inet == 'inet6') ||
 	    ($ipprotocol == 'inet6' && $inet == 'inet')) {
-		return "# ipv4/ipv6 settings dont match selected ipprotocol in nat rule: " . $descr;
+		return "# ipv4/ipv6 settings dont match selected ipprotocol in nat rule{$descr}\n";
 	}
 	if (!empty($ipprotocol)) {
 		$inet = $ipprotocol; //if ipprotocol is set specifically to ipv4 or ipv6 then that has to be used
@@ -2122,11 +2135,7 @@ function filter_nat_rules_generate_if ($if, $descr = "", $ipprotocol = "", $src 
 	if ($natport != "") {
 		$tgtport .= " port {$natport}";
 	}
-	/* sometimes this gets called with "" instead of a value */
-	$src = trim($src);
-	if (empty($src)) {
-		$src = "any";
-	}
+
 	/* Match on this source port */
 	if ($srcport != "") {
 		$srcportexpand = alias_expand($srcport);
@@ -2135,11 +2144,7 @@ function filter_nat_rules_generate_if ($if, $descr = "", $ipprotocol = "", $src 
 		}
 		$src .= " port {$srcportexpand}";
 	}
-	/* sometimes this gets called with "" instead of a value */
-	$dst = trim($dst);
-	if (empty($dst)) {
-		$dst = "any";
-	}
+
 	/* Match on this dest port */
 	if ($dstport != "") {
 		$dstportexpand = alias_expand($dstport);
@@ -2155,12 +2160,9 @@ function filter_nat_rules_generate_if ($if, $descr = "", $ipprotocol = "", $src 
 	} elseif (!$natport) {
 		$tgtport = " port 1024:65535"; // set source port range
 	}
-	if (!empty($descr)) {
-		$descr = " # " . $descr;
-	}
 
 	if (empty($if_friendly) || empty($src) || empty($dst)) {
-		return "# validation of rule properties failed to verify the interface/source/destination" . " in nat rule: {$descr}\n";
+		return "# validation of rule properties failed to verify the interface/source/destination in nat rule{$descr}\n";
 	}
 	/* Put all the pieces together */
 	$natrules = "";
@@ -2170,14 +2172,14 @@ function filter_nat_rules_generate_if ($if, $descr = "", $ipprotocol = "", $src 
 	} else {
 		if ($inet == "" || $inet == 'inet') {
 			if (empty($tgt4)) {
-				$natrules .= "# validation of rule properties failed to verify the IPv4 target" . " in nat rule: {$descr}\n";
+				$natrules .= "# validation of rule properties failed to verify the IPv4 target in nat rule{$descr}\n";
 			} else {
 				$natrules .= "nat on \${$if_friendly} inet{$protocol} from {$src} to {$dst} -> {$tgt4}{$tgtport} {$poolopts}{$staticnatport_txt}{$descr}\n";
 			}
 		}
 		if ($inet == "" || $inet == 'inet6') {
 			if (empty($tgt6)) {
-				$natrules .= "# validation of rule properties failed to verify the IPv6 target" . " in nat rule: {$descr}\n";
+				$natrules .= "# validation of rule properties failed to verify the IPv6 target in nat rule{$descr}\n";
 			} else {
 				$natrules .= "nat on \${$if_friendly} inet6{$protocol} from {$src} to {$dst} -> {$tgt6}{$tgtport} {$poolopts}{$staticnatport_txt}{$descr}\n";
 			}
@@ -2592,12 +2594,17 @@ function filter_nat_rules_generate() {
 
 			$a_outs = filter_nat_rules_outbound_automatic($macroortable);
 			foreach ($a_outs as $a_out) {
+				$a_out_src = isset($a_out['source']['any']) ? 'any' : $a_out['source']['network'];
+				$a_out_dst = isset($a_out['destination']['any']) ? 'any' : $a_out['destination']['network'];
+				if (empty($a_out_src) || empty($a_out_dst)) {
+					continue;
+				}
 				$natrules .= filter_nat_rules_generate_if($a_out['interface'],
 					"",
 					$a_out['ipprotocol'],
-					$a_out['source']['network'],
+					$a_out_src,
 					$a_out['sourceport'],
-					$a_out['destination']['network'],
+					$a_out_dst,
 					$a_out['dstport'],
 					$a_out['target'],
 					$a_out['natport'],
@@ -3427,9 +3434,14 @@ function filter_generate_user_rule($rule, & $extralabels = null) {
 	/* if user has selected a custom gateway, lets work with it */
 	else if ($rule['gateway'] <> "" && $type == "pass") {
 		if (isset($GatewaysList[$rule['gateway']])) {
+			/* Check if the rule uses a failover gateway group that is currently
+			 * in a failover state. If so, add the current tier to use for
+			 * state killing on gateway recovery */
+			$gwlabel_prefix = get_highest_failover_tier_online($rule['gateway']);
+			$gwlabel_prefix = empty($gwlabel_prefix) ? 'gw:' : "gw{$gwlabel_prefix}:";
 			/* Add the load balanced gateways */
 			$aline['route'] = " \$GW{$rule['gateway']} ";
-			$aline['gwlabel'] = "label \"gw:{$rule['gateway']}\"";
+			$aline['gwlabel'] = "label \"{$gwlabel_prefix}{$rule['gateway']}\"";
 		} else if (config_path_enabled('system','skip_rules_gw_down')) {
 			return "# rule " . $rule['descr'] . " disabled because gateway " . $rule['gateway'] . " is down ";
 		} else {
@@ -3591,9 +3603,13 @@ function filter_generate_user_rule($rule, & $extralabels = null) {
 			      ((isset($rule['max-src-conn']) and $rule['max-src-conn'] <> "") or
 			      (isset($rule['max-src-conn-rate']) and $rule['max-src-conn-rate'] <> "") or
 			      (isset($rule['max-src-conn-rates']) and $rule['max-src-conn-rates'] <> ""))) or
+			    (isset($rule['statepolicy']) and !empty($rule['statepolicy'])) or
 			    (isset($rule['sloppy'])) or
 			    (isset($rule['nopfsync']))) {
 				$aline['flags'] .= "( ";
+				if (!empty($rule['statepolicy'])) {
+					$aline['flags'] .= "{$rule['statepolicy']} ";
+				}
 				if (isset($rule['sloppy'])) {
 					$aline['flags'] .= "sloppy ";
 				}
